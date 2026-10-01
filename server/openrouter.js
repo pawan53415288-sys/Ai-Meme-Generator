@@ -21,11 +21,12 @@ const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 // instantly and just burn a slot in the fallback loop.
 const DEFAULT_MODELS = [
   'inclusionai/ling-3.0-flash-sante:free',
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
-  'nvidia/nemotron-3-super-120b-a12b:free',
-  'google/gemma-4-31b-it:free',
-  'google/gemma-4-26b-a4b-it:free',
+  'qwen/qwen3.8-27b:free',
+  'dots-studio/dots-3-note-preview:free',
+  'liquid/lfm-2.5-2.6b:free',
+  'nvidia/nemotron-3.5-lightning:free',
   'inclusionai/ling-3.0-flash-fin:free',
+  'nvidia/nemotron-3.5-lightning:free,
 ]
 
 // Resolved per call rather than at import time, and de-duplicated: an override
