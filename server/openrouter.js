@@ -27,6 +27,7 @@ const DEFAULT_MODELS = [
   'nvidia/nemotron-3.5-lightning:free',
   'inclusionai/ling-3.0-flash-fin:free',
   'nvidia/nemotron-3.5-lightning:free,
+  'thinkingmachines/inkling-small:free'
 ]
 
 // Resolved per call rather than at import time, and de-duplicated: an override
