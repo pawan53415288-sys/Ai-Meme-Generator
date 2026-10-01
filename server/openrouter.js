@@ -15,17 +15,50 @@ const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 // NOTE: OpenRouter's free catalog changes often. If these all 404, run
 // `GET https://openrouter.ai/api/v1/models` and swap in current `:free` ids
 // (or set OPENROUTER_MODEL in .env).
-// Ordered by Hinglish quality (bigger models = more coherent desi humour).
-const FREE_MODELS = [
-  process.env.OPENROUTER_MODEL, // optional override from .env
+//
+// Only ids verified to actually answer are listed. Retired-from-free ids
+// (gpt-oss-20b, nemotron-3-nano, ling-3.0-flash) were removed: they answer 404
+// instantly and just burn a slot in the fallback loop.
+const DEFAULT_MODELS = [
+  'Inception: Mercury Decide (free)',
+  'nvidia/nemotron-3-ultra-550b-a55b:free',
   'nvidia/nemotron-3-super-120b-a12b:free',
   'google/gemma-4-31b-it:free',
-  'openai/gpt-oss-20b:free',
   'google/gemma-4-26b-a4b-it:free',
-  'nvidia/nemotron-3-nano-30b-a3b:free',
-  'inclusionai/ling-3.0-flash:free',
-  'nvidia/nemotron-3.5-lightning:free'
-].filter(Boolean)
+  'inclusionai/ling-3.0-flash-fin:free',
+]
+
+// Resolved per call rather than at import time, and de-duplicated: an override
+// that names a model already in the list would otherwise be tried twice and
+// burn its timeout slot for nothing.
+function configuredModels() {
+  return [...new Set([process.env.OPENROUTER_MODEL, ...DEFAULT_MODELS].filter(Boolean))]
+}
+
+// Free models are unreliable in two very different ways: some fail fast with a
+// 404/429, others accept the request and then never send a body back. Without a
+// deadline the second kind hangs the whole HTTP response forever, which is why
+// the UI used to spin with no error. So every attempt is capped.
+//
+// The cap has to clear the slowest *working* model with headroom: these are
+// reasoning models and a real 5-meme completion measures 25-35s, so anything
+// under ~45s starts killing requests that were about to succeed.
+const PER_MODEL_TIMEOUT_MS = 60_000
+const TOTAL_BUDGET_MS = 90_000
+
+// A model that fails gets pushed to the back of the queue for a while, so one
+// bad afternoon on a free provider doesn't tax every request.
+const DEMOTED_UNTIL = new Map()
+
+function modelOrder() {
+  const now = Date.now()
+  for (const [model, until] of DEMOTED_UNTIL) {
+    if (until <= now) DEMOTED_UNTIL.delete(model)
+  }
+  return configuredModels().sort(
+    (a, b) => Number(DEMOTED_UNTIL.has(a)) - Number(DEMOTED_UNTIL.has(b))
+  )
+}
 
 // templates: [{ id, lines, brief }]  ->  [{ top, bottom }] (one per template)
 export async function generateMemeTexts(theme, templates) {
@@ -35,18 +68,27 @@ export async function generateMemeTexts(theme, templates) {
   }
 
   const prompt = buildPrompt(theme, templates)
+  const deadline = Date.now() + TOTAL_BUDGET_MS
 
   let lastError
-  for (const model of FREE_MODELS) {
+  for (const model of modelOrder()) {
+    if (Date.now() >= deadline) break
+
     try {
-      const texts = await callModel(apiKey, model, prompt)
+      const texts = await callModel(apiKey, model, prompt, deadline)
       if (texts.length >= 1) {
+        DEMOTED_UNTIL.delete(model)
         return normalize(texts, templates.length)
       }
+      lastError = new Error(`${model} replied without any usable meme text`)
     } catch (err) {
       lastError = err
     }
+
+    DEMOTED_UNTIL.set(model, Date.now() + 10 * 60_000)
+    console.warn(`[openrouter] skipping ${model}: ${lastError.message}`)
   }
+
   throw lastError ?? new Error('No meme text returned by any model')
 }
 
@@ -85,59 +127,112 @@ function buildPrompt(theme, templates) {
   ].join('\n')
 }
 
-async function callModel(apiKey, model, prompt) {
-  const res = await fetch(ENDPOINT, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You are a savage desi meme writer who thinks in Hinglish and knows ' +
-            'every classic meme template by heart. You always reply with valid JSON.',
-        },
-        { role: 'user', content: prompt },
-      ],
-      temperature: 0.9,
-    }),
-  })
+async function callModel(apiKey, model, prompt, deadline) {
+  const budget = Math.min(PER_MODEL_TIMEOUT_MS, deadline - Date.now())
+  if (budget <= 0) throw new Error('out of time before trying this model')
+
+  let res
+  try {
+    res = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a savage desi meme writer who thinks in Hinglish and knows ' +
+              'every classic meme template by heart. You always reply with valid JSON.',
+          },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.9,
+      }),
+      signal: AbortSignal.timeout(budget),
+    })
+  } catch (err) {
+    // A free model that accepts the request but never answers lands here.
+    throw new Error(`no answer within ${Math.round(budget / 1000)}s`)
+  }
 
   // fetch does NOT throw on 4xx/5xx — check res.ok yourself (Week 1, Slide 22).
   if (!res.ok) {
-    throw new Error(`OpenRouter responded ${res.status} for ${model}`)
+    throw new Error(`OpenRouter responded ${res.status}`)
   }
 
   const data = await res.json()
+
+  // Upstream provider failures (429 rate limit, 503 overloaded) come back as
+  // HTTP 200 with the failure in the body. Treating those as a normal reply
+  // silently loses the reason, so surface it.
+  if (data?.error) {
+    throw new Error(data.error.message || `OpenRouter error ${data.error.code}`)
+  }
+
   const text = data?.choices?.[0]?.message?.content ?? ''
   return parseMemes(text)
 }
 
-// Models sometimes wrap JSON in ``` fences or add stray text. Parse leniently.
+// Models wrap the JSON in ``` fences, or emit a draft, a "oops let me fix
+// that" note, and then the real JSON. A single greedy /\{[\s\S]*\}/ spans from
+// the first { to the last }, swallowing both objects plus the prose between
+// them — JSON.parse then throws and we fall through to the line-based fallback,
+// which turns the whole reply into junk one-line "memes". So walk the balanced
+// {...} blocks individually and take the first one that actually parses.
 function parseMemes(text) {
-  const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim()
-
-  try {
-    const match = cleaned.match(/\{[\s\S]*\}/)
-    if (match) {
-      const obj = JSON.parse(match[0])
-      const list = Array.isArray(obj.memes) ? obj.memes : Array.isArray(obj) ? obj : null
-      if (list) return list.map(toMeme)
-    }
-  } catch {
-    // fall through
+  for (const block of jsonBlocks(text)) {
+    const list = toMemeList(block)
+    if (list) return list
   }
 
-  // Fallback: treat each non-empty line as a single-line meme.
-  return cleaned
-    .split('\n')
-    .map((line) => line.replace(/^[-*\d.)\s]+/, '').replace(/^"|"$/g, '').trim())
-    .filter(Boolean)
-    .map((top) => ({ top, bottom: '' }))
+  // No JSON anywhere. Returning [] (rather than treating every line as a meme)
+  // lets the caller fall through to the next model — showing the user lines of
+  // prose dressed up as captions is worse than one more retry.
+  return []
+}
+
+// Yields each balanced top-level {...} or [...] block, ignoring brackets that
+// appear inside string literals.
+function* jsonBlocks(text) {
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '{' && text[i] !== '[') continue
+
+    const stack = []
+    let inString = false
+
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j]
+      if (inString) {
+        if (ch === '\\') j++
+        else if (ch === '"') inString = false
+        continue
+      }
+      if (ch === '"') inString = true
+      else if (ch === '{' || ch === '[') stack.push(ch)
+      else if (ch === '}' || ch === ']') {
+        stack.pop()
+        if (stack.length === 0) {
+          yield text.slice(i, j + 1)
+          i = j
+          break
+        }
+      }
+    }
+  }
+}
+
+function toMemeList(block) {
+  try {
+    const obj = JSON.parse(block)
+    const list = Array.isArray(obj?.memes) ? obj.memes : Array.isArray(obj) ? obj : null
+    return list ? list.map(toMeme).filter((m) => m.top || m.bottom) : null
+  } catch {
+    return null
+  }
 }
 
 // Accept a few shapes the model might use and normalise to { top, bottom }.

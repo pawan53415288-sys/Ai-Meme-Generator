@@ -13,6 +13,7 @@ dist-ssr
 *.local
 
 # Environment / secrets
+.env
 server/.env
 .env.local
 .env.*.local

@@ -26,12 +26,20 @@ app.post('/api/memes', async (req, res) => {
     const memes = await createMemes(req.body?.category)
     res.json({ memes })
   } catch (err) {
-    const status = err.status ?? 502
-    if (status >= 500) {
-      console.error('[/api/memes] failed:', err.message)
+    if (err.status) {
+      res.status(err.status).json({ error: err.message })
+      return
     }
-    res.status(status).json({
-      error: status === 400 ? err.message : 'Failed to generate memes',
+
+    console.error('[/api/memes] failed:', err.message)
+
+    // 504 = we gave up waiting on the model, which is retryable and worth
+    // telling apart from a hard failure.
+    const timedOut = /within \d+s|out of time/.test(err.message)
+    res.status(timedOut ? 504 : 502).json({
+      error: timedOut
+        ? 'The meme generator took too long. Please try again.'
+        : 'Failed to generate memes',
     })
   }
 })
