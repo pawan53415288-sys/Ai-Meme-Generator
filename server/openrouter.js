@@ -20,7 +20,7 @@ const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 // (gpt-oss-20b, nemotron-3-nano, ling-3.0-flash) were removed: they answer 404
 // instantly and just burn a slot in the fallback loop.
 const DEFAULT_MODELS = [
-  'Inception: Mercury Decide (free)',
+  'inclusionai/ling-3.0-flash-sante:free',
   'nvidia/nemotron-3-ultra-550b-a55b:free',
   'nvidia/nemotron-3-super-120b-a12b:free',
   'google/gemma-4-31b-it:free',
